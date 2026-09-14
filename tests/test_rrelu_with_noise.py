@@ -30,6 +30,14 @@ def _bounds(training):
 
 
 def _run(op_name, self, noise, lower, upper, training, generator=None):
+    # 参考端经 to_reference 后通常在 CPU 上，ATen 可直接算；
+    # 被测端在 flag_gems.device 上，走 FlagGems 的 Triton 实现。
+    if self.device.type == "cpu":
+        op = (torch.ops.aten.rrelu_with_noise_ if op_name.endswith("_")
+              else torch.ops.aten.rrelu_with_noise)
+        if generator is None:
+            return op(self, noise, lower, upper, training)
+        return op(self, noise, lower, upper, training, generator=generator)
     op = getattr(flag_gems, op_name)
     return op(self, noise, lower, upper, training, generator)
 
