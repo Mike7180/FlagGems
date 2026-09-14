@@ -25,22 +25,37 @@ from flag_gems.utils import pointwise_dynamic
 
 class RReLUWithNoiseFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input, noise, lower, upper, training, generator=None):
-        output = _rrelu_with_noise_impl(input, noise, lower, upper, training, generator)
+    def forward(
+        ctx, input, noise, lower, upper, training, generator=None, inplace=False
+    ):
+        if inplace:
+            output = _rrelu_with_noise_impl(
+                input, noise, lower, upper, training, generator, out=input
+            )
+        else:
+            output = _rrelu_with_noise_impl(
+                input, noise, lower, upper, training, generator
+            )
         ctx.save_for_backward(input, noise)
         ctx.lower = lower
         ctx.upper = upper
         ctx.training = training
+        ctx.self_is_result = inplace
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         input, noise = ctx.saved_tensors
         grad_input = rrelu_with_noise_backward(
-            grad_output, input, noise, ctx.lower, ctx.upper, ctx.training, False
+            grad_output,
+            input,
+            noise,
+            ctx.lower,
+            ctx.upper,
+            ctx.training,
+            ctx.self_is_result,
         )
-        # 对应 forward 的 6 个输入
-        return grad_input, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 logger = logging.getLogger(__name__)
@@ -171,8 +186,10 @@ def rrelu_with_noise_(
 ):
     """FlagGems implementation of aten.rrelu_with_noise_."""
     logger.debug("GEMS RRELU_WITH_NOISE_")
-    _rrelu_with_noise_impl(self, noise, lower, upper, training, generator, out=self)
-    return self
+    # _rrelu_with_noise_impl(self, noise, lower, upper, training, generator, out=self)
+    return RReLUWithNoiseFunction.apply(
+        self, noise, lower, upper, training, generator, True
+    )
 
 
 __all__ = ["rrelu_with_noise", "rrelu_with_noise_"]

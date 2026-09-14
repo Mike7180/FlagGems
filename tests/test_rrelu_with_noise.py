@@ -33,8 +33,11 @@ def _run(op_name, self, noise, lower, upper, training, generator=None):
     # 参考端经 to_reference 后通常在 CPU 上，ATen 可直接算；
     # 被测端在 flag_gems.device 上，走 FlagGems 的 Triton 实现。
     if self.device.type == "cpu":
-        op = (torch.ops.aten.rrelu_with_noise_ if op_name.endswith("_")
-              else torch.ops.aten.rrelu_with_noise)
+        op = (
+            torch.ops.aten.rrelu_with_noise_
+            if op_name.endswith("_")
+            else torch.ops.aten.rrelu_with_noise
+        )
         if generator is None:
             return op(self, noise, lower, upper, training)
         return op(self, noise, lower, upper, training, generator=generator)
@@ -57,10 +60,15 @@ def _assert_training_contract(result, original, noise, lower, upper):
 
     assert torch.all(noise[sampled] >= lower_bound)
     assert torch.all(noise[sampled] <= upper_bound)
-    utils.gems_assert_equal(noise[not_sampled], torch.ones_like(noise[not_sampled]))
+    utils.gems_assert_equal(
+        noise[not_sampled],
+        utils.to_reference(torch.ones_like(noise[not_sampled])),
+    )
+    # utils.gems_assert_equal(noise[not_sampled], torch.ones_like(noise[not_sampled]))
 
     expected = torch.where(sampled, original * noise, original)
-    utils.gems_assert_close(result, expected, original.dtype)
+    utils.gems_assert_close(result, utils.to_reference(expected), original.dtype)
+    # utils.gems_assert_close(result, expected, original.dtype)
 
 
 @pytest.mark.rrelu_with_noise
@@ -106,7 +114,8 @@ def test_rrelu_with_noise_training_random_contract(op_name, dtype):
     sampled_noise = noise[sampled]
     assert torch.any(sampled_noise != sampled_noise[0])
     if not op_name.endswith("_"):
-        utils.gems_assert_equal(inp, original)
+        utils.gems_assert_equal(inp, utils.to_reference(original))
+        # utils.gems_assert_equal(inp, original)
 
 
 @pytest.mark.rrelu_with_noise
@@ -130,8 +139,10 @@ def test_rrelu_with_noise_generator_reproducibility(op_name, dtype):
         outputs.append(_run(op_name, inp, noise, lower, upper, True, generator))
         noises.append(noise)
 
-    utils.gems_assert_equal(outputs[0], outputs[1])
-    utils.gems_assert_equal(noises[0], noises[1])
+    # utils.gems_assert_equal(outputs[0], outputs[1])
+    # utils.gems_assert_equal(noises[0], noises[1])
+    utils.gems_assert_equal(outputs[0], utils.to_reference(outputs[1]))
+    utils.gems_assert_equal(noises[0], utils.to_reference(noises[1]))
     assert not torch.equal(noises[0], noises[2])
 
     advanced_input = original.clone()
@@ -246,8 +257,10 @@ def test_rrelu_with_noise_non_contiguous(op_name, training, dtype):
         assert torch.any(sampled_noise != sampled_noise[0])
     else:
         utils.gems_assert_close(result, ref_result, dtype)
-    utils.gems_assert_equal(input_base[:, 1::2], input_untouched)
-    utils.gems_assert_equal(noise_base[:, 1::2], noise_untouched)
+    # utils.gems_assert_equal(input_base[:, 1::2], input_untouched)
+    # utils.gems_assert_equal(noise_base[:, 1::2], noise_untouched)
+    utils.gems_assert_equal(input_base[:, 1::2], utils.to_reference(input_untouched))
+    utils.gems_assert_equal(noise_base[:, 1::2], utils.to_reference(noise_untouched))
 
 
 @pytest.mark.rrelu_with_noise
@@ -277,9 +290,11 @@ def test_rrelu_with_noise_eval_does_not_modify_noise(op_name):
 
     _run(op_name, inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, False)
 
-    utils.gems_assert_equal(noise, noise_before)
+    # utils.gems_assert_equal(noise, noise_before)
+    utils.gems_assert_equal(noise, utils.to_reference(noise_before))
     if not op_name.endswith("_"):
-        utils.gems_assert_equal(inp, input_before)
+        # utils.gems_assert_equal(inp, input_before)
+        utils.gems_assert_equal(inp, utils.to_reference(input_before))
 
 
 @pytest.mark.rrelu_with_noise
