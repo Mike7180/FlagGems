@@ -11655,25 +11655,6 @@ ops:
   - Math
   stages:
   - beta: '5.3'
-- id: rrelu_with_noise_backward
-  description: 'Computes the gradient of the Randomized Leaky ReLU (RReLU) activation
-    function with respect to
-
-    its input during backpropagation. It uses the noise tensor generated in the forward
-    pass
-
-    to correctly apply the slope to negative input values.
-
-    '
-  for:
-  - rrelu_with_noise_backward
-  labels:
-  - aten
-  - KernelGen
-  kind:
-  - NeuralNetwork
-  stages:
-  - beta: '5.0'
 - id: rrelu_with_noise
   description: 'Triton kernel implementation for rrelu_with_noise
     '
@@ -11696,6 +11677,25 @@ ops:
   - NeuralNetwork
   stages:
   - beta: '5.4'
+- id: rrelu_with_noise_backward
+  description: 'Computes the gradient of the Randomized Leaky ReLU (RReLU) activation
+    function with respect to
+
+    its input during backpropagation. It uses the noise tensor generated in the forward
+    pass
+
+    to correctly apply the slope to negative input values.
+
+    '
+  for:
+  - rrelu_with_noise_backward
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - beta: '5.0'
 - id: rrelu_with_noise_functional
   description: 'Triton kernel implementation for rrelu_with_noise_functional.
 
