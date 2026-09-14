@@ -19,9 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.ops.rrelu_with_noise_backward import (
-    rrelu_with_noise_backward,
-)  # 导入反向函数
+from flag_gems.ops.rrelu_with_noise_backward import rrelu_with_noise_backward
 from flag_gems.utils import pointwise_dynamic
 
 
