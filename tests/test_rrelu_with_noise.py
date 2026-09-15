@@ -12,357 +12,434 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Unit tests for ``flag_gems.rrelu_with_noise`` and ``flag_gems.rrelu_with_noise_``.
+
+Both operators implement::
+
+    aten::rrelu_with_noise(Tensor self, Tensor(a!) noise, Scalar lower,
+                           Scalar upper, bool training, Generator? generator)
+
+whose contract is:
+
+* ``training=False``: ``out = self > 0 ? self : self * (lower + upper) / 2`` and
+  the caller's ``noise`` buffer is left untouched;
+* ``training=True``: every ``self <= 0`` element gets a slope drawn uniformly
+  from ``[lower, upper]`` and stored in ``noise``, every other element stores
+  ``1``, and ``out = self * noise``.
+
+The tests either compare the FlagGems API against the native ATen kernel (the
+unit-test reference, run on ``utils.to_reference`` tensors) or verify an
+invariant of the contract above that no reference is needed for.  The FlagGems
+API is always called explicitly and without ``flag_gems.use_gems``, as required
+by ``docs/content/zh-cn/contribution/overview.md``.
+"""
+
 import pytest
 import torch
 
 import flag_gems
 
 from . import accuracy_utils as utils
+from . import conftest as cfg
 
+# Defaults of torch.nn.functional.rrelu.
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 1.0 / 3.0
 
+# A training call draws its slopes from the global generator, which cannot be
+# replayed on the reference side.  Equal bounds remove that randomness -- every
+# sampled element then holds exactly this slope -- so that the applied noise and
+# the output stay comparable element-wise with ATen.  The sampling itself is
+# covered by test_rrelu_with_noise_train_sampling.
+EQUAL_BOUNDS = (0.25, 0.25)
 
-def _bounds(training):
-    # Equal bounds remove random-number differences between reference and
-    # FlagGems while still exercising the training branch.
-    return (0.25, 0.25) if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+# Values that pick a branch of the kernels: the training slope is drawn for
+# `self <= 0` (signed zero included), the eval slope for `self <= 0` as well,
+# and NaN never takes the `self > 0` side.
+BOUNDARY_VALUES = [
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+]
+
+OP_NAMES = ["rrelu_with_noise", "rrelu_with_noise_"]
+
+# The implementation under test, called through the public FlagGems API.
+GEMS_OP = {
+    "rrelu_with_noise": flag_gems.rrelu_with_noise,
+    "rrelu_with_noise_": flag_gems.rrelu_with_noise_,
+}
+
+# The native operator, used as the unit-test reference.
+ATEN_OP = {
+    "rrelu_with_noise": torch.ops.aten.rrelu_with_noise,
+    "rrelu_with_noise_": torch.ops.aten.rrelu_with_noise_,
+}
 
 
-def _run(op_name, self, noise, lower, upper, training, generator=None):
-    # 参考端经 to_reference 后通常在 CPU 上，ATen 可直接算；
-    # 被测端在 flag_gems.device 上，走 FlagGems 的 Triton 实现。
-    if self.device.type == "cpu":
-        op = (
-            torch.ops.aten.rrelu_with_noise_
-            if op_name.endswith("_")
-            else torch.ops.aten.rrelu_with_noise
-        )
-        if generator is None:
-            return op(self, noise, lower, upper, training)
-        return op(self, noise, lower, upper, training, generator=generator)
-    op = getattr(flag_gems, op_name)
-    return op(self, noise, lower, upper, training, generator)
+def _run(op_name, side, self, noise, lower, upper, training, generator=None):
+    """Call one side (FlagGems or ATen) with the operator's public signature."""
+    return side[op_name](self, noise, lower, upper, training, generator)
 
 
-def _training_sample_mask(inp):
-    # torch_npu records a unit slope at signed zero, while the CPU/CUDA ATen
-    # implementation samples signed zero. Match the native reference selected
-    # by FlagGems on each platform.
-    return inp < 0 if flag_gems.vendor_name == "ascend" else inp <= 0
+def _skip_half_cpu_reference(dtype, training):
+    """Skip the cases the CPU reference cannot serve.
+
+    ``torch.ops.aten.rrelu_with_noise`` has no Half kernel for the training
+    path on CPU: it raises "rrelu_with_noise_out_cpu not implemented for
+    'Half'".  fp16 keeps being covered by the reference-free tests.
+    """
+    if cfg.TO_CPU and training and dtype == torch.float16:
+        pytest.skip("the CPU reference does not implement the training path for Half")
 
 
-def _assert_training_contract(result, original, noise, lower, upper):
-    sampled = _training_sample_mask(original)
-    not_sampled = ~sampled
-    lower_bound = torch.tensor(lower, dtype=noise.dtype, device=noise.device)
-    upper_bound = torch.tensor(upper, dtype=noise.dtype, device=noise.device)
+def _pair(shape, dtype, bounds, fill_noise=False):
+    """Build matched (FlagGems, reference) inputs.
 
-    assert torch.all(noise[sampled] >= lower_bound)
-    assert torch.all(noise[sampled] <= upper_bound)
-    utils.gems_assert_equal(
-        noise[not_sampled],
-        utils.to_reference(torch.ones_like(noise[not_sampled])),
+    ``fill_noise`` pre-fills the caller's noise buffer with a random slope, so
+    that the eval path is tested against a buffer that differs from the unit
+    slope rather than against zeros.
+    """
+    lower, upper = bounds
+    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
+    noise = torch.zeros_like(inp)
+    if fill_noise:
+        noise.uniform_(lower, upper)
+    return (
+        inp,
+        noise,
+        utils.to_reference(inp.clone()),
+        utils.to_reference(noise.clone()),
     )
-    # utils.gems_assert_equal(noise[not_sampled], torch.ones_like(noise[not_sampled]))
 
-    expected = torch.where(sampled, original * noise, original)
-    utils.gems_assert_close(result, utils.to_reference(expected), original.dtype)
-    # utils.gems_assert_close(result, expected, original.dtype)
+
+def _forward_backward(side, op_name, base, bounds, training):
+    """One forward/backward pass through ``side``; returns (out, noise, grad).
+
+    The gradient is read from ``leaf``, the only tensor of the graph that
+    requires grad, so that both sides can be compared through it.
+    """
+    leaf = base.clone().requires_grad_()
+    if op_name.endswith("_"):
+        # An in-place operator rejects a leaf that requires grad; a non-leaf
+        # self is the legal path and exercises the self_is_result branch.
+        self_t = leaf * 1.0
+    else:
+        self_t = leaf
+    noise = torch.zeros_like(self_t)
+    out = _run(op_name, side, self_t, noise, *bounds, training)
+    out.sum().backward()
+    return out, noise, leaf.grad
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_rrelu_with_noise(op_name, training, shape, dtype):
-    lower, upper = _bounds(training)
-    inp = torch.randn(shape, dtype=dtype, device=flag_gems.device)
-    noise = torch.zeros_like(inp)
-    if not training:
-        noise.uniform_(lower, upper)
+def test_rrelu_with_noise_eval(op_name, shape, dtype):
+    """Eval mode matches ATen and leaves the caller's noise buffer untouched."""
+    lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
+    inp, noise, ref_inp, ref_noise = _pair(
+        shape, dtype, (lower, upper), fill_noise=True
+    )
 
-    ref_inp = utils.to_reference(inp.clone())
-    ref_noise = utils.to_reference(noise.clone())
-    ref_result = _run(op_name, ref_inp, ref_noise, lower, upper, training)
+    ref_out = _run(op_name, ATEN_OP, ref_inp, ref_noise, lower, upper, False)
+    result = _run(op_name, GEMS_OP, inp, noise, lower, upper, False)
 
-    result = _run(op_name, inp, noise, lower, upper, training)
-
-    # This checks the public alias contract. It cannot by itself distinguish a
-    # direct out0 write from a temporary followed by copy_, so the kernel call
-    # must also be reviewed/covered by the implementation path below.
-    if op_name.endswith("_"):
-        assert result.data_ptr() == inp.data_ptr()
-    utils.gems_assert_close(result, ref_result, dtype)
+    utils.gems_assert_close(result, ref_out, dtype)
     utils.gems_assert_close(noise, ref_noise, dtype)
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 @pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_rrelu_with_noise_training_random_contract(op_name, dtype):
+def test_rrelu_with_noise_train(op_name, shape, dtype):
+    """Training mode matches ATen: the same effective noise and output.
+
+    The bounds are equal so that the sampled slope is deterministic; see
+    ``EQUAL_BOUNDS``.
+    """
+    _skip_half_cpu_reference(dtype, True)
+    lower, upper = EQUAL_BOUNDS
+    inp, noise, ref_inp, ref_noise = _pair(shape, dtype, (lower, upper))
+
+    ref_out = _run(op_name, ATEN_OP, ref_inp, ref_noise, lower, upper, True)
+    result = _run(op_name, GEMS_OP, inp, noise, lower, upper, True)
+
+    utils.gems_assert_close(result, ref_out, dtype)
+    # `noise` reports the effective slope: the sampled one for `self <= 0` and
+    # a unit slope everywhere else.
+    utils.gems_assert_close(noise, ref_noise, dtype)
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
+def test_rrelu_with_noise_train_sampling(op_name, dtype):
+    """The slope must be uniform over the whole ``[lower, upper]`` range and be
+    drawn for exactly the ``self <= 0`` elements."""
     lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
+    span = upper - lower
     original = torch.linspace(-2.0, 2.0, 4097, dtype=dtype, device=flag_gems.device)
     inp = original.clone()
     noise = torch.zeros_like(inp)
 
-    result = _run(op_name, inp, noise, lower, upper, True)
+    result = _run(op_name, GEMS_OP, inp, noise, lower, upper, True)
 
-    sampled = _training_sample_mask(original)
-    _assert_training_contract(result, original, noise, lower, upper)
-    sampled_noise = noise[sampled]
-    assert torch.any(sampled_noise != sampled_noise[0])
+    sampled = original <= 0
+    assert 0 < int(sampled.sum()) < sampled.numel()
+    drawn = noise[sampled]
+
+    assert torch.all(drawn >= lower)
+    assert torch.all(drawn <= upper)
+    # ~2000 draws must cover the interval rather than a sub-range of it: their
+    # extreme values sit close to the bounds and their mean close to the middle.
+    assert drawn.min() <= lower + span * 1e-2
+    assert drawn.max() >= upper - span * 1e-2
+    assert abs(float(drawn.mean()) - (lower + upper) / 2) <= span * 1e-1
+    assert torch.any(drawn != drawn[0])
+
+    # Every other element stores a unit slope, and the output is the input
+    # scaled by the effective noise.
+    utils.gems_assert_equal(
+        noise[~sampled], utils.to_reference(torch.ones_like(noise[~sampled]))
+    )
+    expected = utils.to_reference(torch.where(sampled, original * noise, original))
+    utils.gems_assert_close(result, expected, dtype)
     if not op_name.endswith("_"):
         utils.gems_assert_equal(inp, utils.to_reference(original))
-        # utils.gems_assert_equal(inp, original)
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_rrelu_with_noise_generator_reproducibility(op_name, dtype):
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+def test_rrelu_with_noise_generator(op_name):
+    """The generator argument drives the training slope: equal seeds reproduce
+    it exactly, different seeds do not, and the stream keeps advancing."""
     lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
-    original = -torch.ones((4096,), dtype=dtype, device=flag_gems.device)
+    original = -torch.ones((4096,), dtype=torch.float32, device=flag_gems.device)
 
-    generators = []
-    for seed in (2026, 2026, 2027):
+    def draw(seed):
         generator = torch.Generator(device=flag_gems.device)
         generator.manual_seed(seed)
-        generators.append(generator)
-
-    outputs = []
-    noises = []
-    for generator in generators:
         inp = original.clone()
         noise = torch.zeros_like(inp)
-        outputs.append(_run(op_name, inp, noise, lower, upper, True, generator))
-        noises.append(noise)
+        out = _run(op_name, GEMS_OP, inp, noise, lower, upper, True, generator)
+        return generator, out, noise
 
-    # utils.gems_assert_equal(outputs[0], outputs[1])
-    # utils.gems_assert_equal(noises[0], noises[1])
-    utils.gems_assert_equal(outputs[0], utils.to_reference(outputs[1]))
-    utils.gems_assert_equal(noises[0], utils.to_reference(noises[1]))
-    assert not torch.equal(noises[0], noises[2])
+    _, out_a, noise_a = draw(2026)
+    generator_b, out_b, noise_b = draw(2026)
+    _, _, noise_c = draw(2027)
 
-    advanced_input = original.clone()
-    advanced_noise = torch.zeros_like(advanced_input)
-    advanced_output = _run(
-        op_name,
-        advanced_input,
-        advanced_noise,
-        lower,
-        upper,
-        True,
-        generators[0],
-    )
+    assert torch.equal(out_a, out_b)
+    assert torch.equal(noise_a, noise_b)
+    assert not torch.equal(noise_a, noise_c)
 
-    assert not torch.equal(noises[0], advanced_noise)
-    _assert_training_contract(advanced_output, original, advanced_noise, lower, upper)
+    inp = original.clone()
+    noise = torch.zeros_like(inp)
+    _run(op_name, GEMS_OP, inp, noise, lower, upper, True, generator_b)
+    assert not torch.equal(noise, noise_a)
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-def test_rrelu_with_noise_eval_does_not_advance_generator(op_name):
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+def test_rrelu_with_noise_eval_is_side_effect_free(op_name):
+    """Eval mode consumes no randomness and writes to neither input tensor."""
     generator = torch.Generator(device=flag_gems.device)
     generator.manual_seed(2026)
     state_before = generator.get_state().clone()
     inp = torch.randn((257,), device=flag_gems.device)
     noise = torch.randn_like(inp)
+    noise_before = noise.clone()
+    input_before = inp.clone()
 
-    _run(
-        op_name,
-        inp,
-        noise,
-        DEFAULT_LOWER,
-        DEFAULT_UPPER,
-        False,
-        generator,
-    )
+    _run(op_name, GEMS_OP, inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, False, generator)
 
     assert torch.equal(generator.get_state(), state_before)
+    assert torch.equal(noise, noise_before)
+    if not op_name.endswith("_"):
+        assert torch.equal(inp, input_before)
 
 
 @pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
 @pytest.mark.parametrize("training", [False, True])
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_rrelu_with_noise_inplace_alias(training, dtype):
-    lower, upper = _bounds(training)
-    inp = torch.randn((37,), dtype=dtype, device=flag_gems.device)
-    noise = torch.zeros_like(inp)
-    if not training:
-        noise.uniform_(lower, upper)
+def test_rrelu_with_noise_aliasing(op_name, training):
+    """The in-place variant writes into and returns ``self``; the out-of-place
+    variant returns a buffer that aliases neither ``self`` nor ``noise``."""
+    lower, upper = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+    inp = torch.randn((37, 11), dtype=torch.float32, device=flag_gems.device)
+    noise = torch.zeros_like(inp) if training else torch.rand_like(inp)
     input_ptr = inp.data_ptr()
+    noise_ptr = noise.data_ptr()
+    input_before = inp.clone()
 
-    result = _run("rrelu_with_noise_", inp, noise, lower, upper, training)
+    result = _run(op_name, GEMS_OP, inp, noise, lower, upper, training)
 
-    assert result.data_ptr() == input_ptr
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-def test_rrelu_with_noise_training_mask(op_name):
-    # NaN takes the non-sampled path and records one. Signed-zero behavior is
-    # checked against the platform's native aten implementation.
-    dtype = torch.float32
-    lower = upper = 0.25
-    values = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0, 1.0, -1.0]
-    inp = torch.tensor(values, dtype=dtype, device=flag_gems.device)
-    noise = torch.zeros_like(inp)
-
-    ref_inp = utils.to_reference(inp.clone())
-    ref_noise = torch.zeros_like(ref_inp)
-    ref_result = _run(op_name, ref_inp, ref_noise, lower, upper, True)
-
-    result = _run(op_name, inp, noise, lower, upper, True)
-
-    utils.gems_assert_close(result, ref_result, dtype, equal_nan=True)
-    utils.gems_assert_close(noise, ref_noise, dtype)
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-@pytest.mark.parametrize("training", [False, True])
-@pytest.mark.parametrize("dtype", utils.ALL_FLOAT_DTYPES)
-def test_rrelu_with_noise_non_contiguous(op_name, training, dtype):
-    lower, upper = (DEFAULT_LOWER, DEFAULT_UPPER) if training else _bounds(training)
-    input_base = torch.linspace(
-        -2.0,
-        2.0,
-        17 * 22,
-        dtype=dtype,
-        device=flag_gems.device,
-    ).reshape(17, 22)
-    noise_base = torch.zeros_like(input_base)
-    input_untouched = input_base[:, 1::2].clone()
-    noise_untouched = noise_base[:, 1::2].clone()
-    inp = input_base[:, ::2]
-    noise = noise_base[:, ::2]
-    assert not inp.is_contiguous()
-    assert not noise.is_contiguous()
-
-    original = inp.clone()
-    if not training:
-        ref_input_base = utils.to_reference(input_base.clone())
-        ref_noise_base = utils.to_reference(noise_base.clone())
-        ref_inp = ref_input_base[:, ::2]
-        ref_noise = ref_noise_base[:, ::2]
-        ref_result = _run(op_name, ref_inp, ref_noise, lower, upper, training)
-
-    result = _run(op_name, inp, noise, lower, upper, training)
-
-    if training:
-        _assert_training_contract(result, original, noise, lower, upper)
-        sampled_noise = noise[_training_sample_mask(original)]
-        assert torch.any(sampled_noise != sampled_noise[0])
+    if op_name.endswith("_"):
+        assert result.data_ptr() == input_ptr
     else:
-        utils.gems_assert_close(result, ref_result, dtype)
-    # utils.gems_assert_equal(input_base[:, 1::2], input_untouched)
-    # utils.gems_assert_equal(noise_base[:, 1::2], noise_untouched)
-    utils.gems_assert_equal(input_base[:, 1::2], utils.to_reference(input_untouched))
-    utils.gems_assert_equal(noise_base[:, 1::2], utils.to_reference(noise_untouched))
+        assert result.data_ptr() != input_ptr
+        assert result.data_ptr() != noise_ptr
+        assert torch.equal(inp, input_before)
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("shape", [(0,), (0, 7), (2, 0, 3)])
 def test_rrelu_with_noise_empty(op_name, training, shape):
+    """Empty inputs keep the shape, the dtype and the in-place contract."""
     inp = torch.empty(shape, device=flag_gems.device)
     noise = torch.empty_like(inp)
     input_ptr = inp.data_ptr()
 
-    result = _run(op_name, inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, training)
+    result = _run(op_name, GEMS_OP, inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, training)
 
     assert result.shape == inp.shape
     assert result.dtype == inp.dtype
     if op_name.endswith("_"):
         assert result.data_ptr() == input_ptr
+    # The out-of-place aliasing contract is not asserted here: zero-sized
+    # buffers all share one address, so neither the pointer nor the object
+    # identity tells an allocated result from the input.  See
+    # test_rrelu_with_noise_aliasing for that contract.
 
 
 @pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
-def test_rrelu_with_noise_eval_does_not_modify_noise(op_name):
-    inp = torch.randn((257,), device=flag_gems.device)
-    noise = torch.randn_like(inp)
-    noise_before = noise.clone()
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("dtype", utils.PRIMARY_FLOAT_DTYPES)
+def test_rrelu_with_noise_non_contiguous(op_name, training, dtype):
+    """Strided views match ATen and leave the memory outside the view alone."""
+    _skip_half_cpu_reference(dtype, training)
+    lower, upper = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+    input_base = torch.linspace(
+        -2.0, 2.0, 17 * 22, dtype=dtype, device=flag_gems.device
+    ).reshape(17, 22)
+    noise_base = torch.zeros_like(input_base)
+    untouched_input = input_base[:, 1::2].clone()
+    untouched_noise = noise_base[:, 1::2].clone()
+
+    inp = input_base[:, ::2]
+    noise = noise_base[:, ::2]
+    assert not inp.is_contiguous()
+    assert not noise.is_contiguous()
+
+    ref_inp = utils.to_reference(inp.clone())
+    ref_noise = utils.to_reference(noise.clone())
+    ref_out = _run(op_name, ATEN_OP, ref_inp, ref_noise, lower, upper, training)
+
+    result = _run(op_name, GEMS_OP, inp, noise, lower, upper, training)
+
+    utils.gems_assert_close(result, ref_out, dtype)
+    utils.gems_assert_close(noise, ref_noise, dtype)
+    assert torch.equal(input_base[:, 1::2], untouched_input)
+    assert torch.equal(noise_base[:, 1::2], untouched_noise)
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("training", [False, True])
+def test_rrelu_with_noise_autograd(op_name, training):
+    """Gradients match ATen in both training modes."""
+    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+    base = torch.randn((257,), dtype=torch.float32, device=flag_gems.device)
+    ref_base = utils.to_reference(base.clone())
+
+    _, _, ref_grad = _forward_backward(ATEN_OP, op_name, ref_base, bounds, training)
+    _, _, gems_grad = _forward_backward(GEMS_OP, op_name, base, bounds, training)
+
+    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("training", [False, True])
+def test_rrelu_with_noise_autograd_boundary(op_name, training):
+    """Signed zero, infinities and NaN take the same branch as ATen in the
+    forward and in the backward kernel.
+
+    The kernels select their slope with ``self > 0``, so an implementation that
+    tests ``self >= 0`` would diverge exactly on these values.
+    """
+    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+    base = torch.tensor(BOUNDARY_VALUES, dtype=torch.float32, device=flag_gems.device)
+    ref_base = utils.to_reference(base.clone())
+
+    ref_out, ref_noise, ref_grad = _forward_backward(
+        ATEN_OP, op_name, ref_base, bounds, training
+    )
+    gems_out, gems_noise, gems_grad = _forward_backward(
+        GEMS_OP, op_name, base, bounds, training
+    )
+
+    utils.gems_assert_close(gems_out, ref_out, torch.float32, equal_nan=True)
+    utils.gems_assert_close(gems_noise, ref_noise, torch.float32)
+    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("op_name", OP_NAMES)
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("noise_shape", "same shape"),
+        ("noise_dtype", "same dtype"),
+        ("self_dtype", "not implemented"),
+        ("noise_device", "same device"),
+        ("lower_infinite", "must be finite"),
+        ("upper_nan", "must be finite"),
+        ("bounds_swapped", "less than or equal"),
+    ],
+)
+def test_rrelu_with_noise_invalid_args(op_name, training, case, match):
+    """Invalid arguments are rejected before either tensor is touched."""
+    inp = torch.randn((5,), dtype=torch.float32, device=flag_gems.device)
+    noise = torch.zeros_like(inp)
+    lower, upper = DEFAULT_LOWER, DEFAULT_UPPER
+
+    if case == "noise_shape":
+        noise = torch.zeros((3,), dtype=torch.float32, device=flag_gems.device)
+    elif case == "noise_dtype":
+        noise = torch.zeros((5,), dtype=torch.int32, device=flag_gems.device)
+    elif case == "self_dtype":
+        inp = torch.ones((5,), dtype=torch.int32, device=flag_gems.device)
+        noise = torch.zeros((5,), dtype=torch.int32, device=flag_gems.device)
+    elif case == "noise_device":
+        if flag_gems.device == "cpu":
+            pytest.skip("needs a second device to pair with the CPU reference")
+        noise = torch.zeros((5,), dtype=torch.float32, device="cpu")
+    elif case == "lower_infinite":
+        lower = float("inf")
+    elif case == "upper_nan":
+        upper = float("nan")
+    elif case == "bounds_swapped":
+        lower, upper = DEFAULT_UPPER, DEFAULT_LOWER
+
     input_before = inp.clone()
+    noise_before = noise.clone()
 
-    _run(op_name, inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, False)
+    with pytest.raises(RuntimeError, match=match):
+        _run(op_name, GEMS_OP, inp, noise, lower, upper, training)
 
-    # utils.gems_assert_equal(noise, noise_before)
-    utils.gems_assert_equal(noise, utils.to_reference(noise_before))
-    if not op_name.endswith("_"):
-        # utils.gems_assert_equal(inp, input_before)
-        utils.gems_assert_equal(inp, utils.to_reference(input_before))
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_autograd(training):
-    dtype = torch.float32
-    lower, upper = _bounds(training)
-    inp = torch.randn((257,), dtype=dtype, device=flag_gems.device)
-
-    ref_inp = utils.to_reference(inp.clone()).requires_grad_()
-    # ref_noise = torch.zeros_like(ref_inp).requires_grad_()
-    ref_noise = torch.zeros_like(ref_inp)
-    ref_out = _run("rrelu_with_noise", ref_inp, ref_noise, lower, upper, training)
-    ref_out.sum().backward()
-
-    gems_inp = inp.clone().requires_grad_()
-    gems_noise = torch.zeros_like(gems_inp)
-    gems_out = _run("rrelu_with_noise", gems_inp, gems_noise, lower, upper, training)
-    gems_out.sum().backward()
-
-    utils.gems_assert_close(gems_inp.grad, ref_inp.grad, dtype)
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_inplace_autograd_non_leaf(training):
-    # A leaf requiring grad is correctly rejected by PyTorch for any in-place
-    # operator. A non-leaf requiring grad is the legal path and exercises the
-    # self_is_result=True backward route.
-    dtype = torch.float32
-    lower, upper = _bounds(training)
-    source = torch.randn((257,), dtype=dtype, device=flag_gems.device)
-
-    ref_leaf = utils.to_reference(source.clone()).requires_grad_()
-    ref_self = ref_leaf * 1.0
-    ref_noise = torch.zeros_like(ref_self)
-    ref_out = _run("rrelu_with_noise_", ref_self, ref_noise, lower, upper, training)
-    ref_out.sum().backward()
-
-    gems_leaf = source.clone().requires_grad_()
-    gems_self = gems_leaf * 1.0
-    gems_noise = torch.zeros_like(gems_self)
-    gems_out = _run("rrelu_with_noise_", gems_self, gems_noise, lower, upper, training)
-    gems_out.sum().backward()
-
-    utils.gems_assert_close(gems_leaf.grad, ref_leaf.grad, dtype)
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_backward_self_is_result(training):
-    # Explicitly cover the backward variant used when the forward op was
-    # in-place and the saved self tensor is the result tensor.
-    dtype = torch.float32
-    lower, upper = _bounds(training)
-    grad_output = torch.randn((257,), dtype=dtype, device=flag_gems.device)
-    result = torch.randn((257,), dtype=dtype, device=flag_gems.device)
-    noise = torch.full_like(result, lower)
-
-    ref_grad = utils.to_reference(grad_output)
-    ref_result = utils.to_reference(result)
-    ref_noise = utils.to_reference(noise)
-    ref_out = torch.ops.aten.rrelu_with_noise_backward(
-        ref_grad, ref_result, ref_noise, lower, upper, training, True
-    )
-
-    gems_out = torch.ops.aten.rrelu_with_noise_backward(
-        grad_output, result, noise, lower, upper, training, True
-    )
-
-    utils.gems_assert_close(gems_out, ref_out, dtype)
+    assert torch.equal(inp, input_before)
+    assert torch.equal(noise, noise_before)
