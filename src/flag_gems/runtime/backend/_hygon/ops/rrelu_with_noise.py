@@ -92,8 +92,12 @@ def _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off, sampled, N):
 
 
 # The count argument is spelled ``N`` because the heuristic config is keyed on
-# that name, exactly as in the generic ``uniform``.
-@triton.heuristics(runtime.get_heuristic_config("uniform"))
+# that name, exactly as in the generic ``uniform``.  The config is read here
+# rather than through ``triton.heuristics``, which routes every launch through
+# the autotuner's bookkeeping for a value that never varies.
+_UNIFORM_HEURISTICS = runtime.get_heuristic_config("uniform")
+
+
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def _rrelu_with_noise_train_contiguous_kernel(
     x_ptr,
@@ -190,12 +194,15 @@ def _launch_contiguous_train(self, noise, out, lower, upper, generator):
     n_elements = out.numel()
     if n_elements == 0:
         return out
-    grid_fn = lambda meta: (triton.cdiv(n_elements, meta["BLOCK"] * _TRAIN_UNROLL),)
+    heuristics = {"N": n_elements}
+    block = _UNIFORM_HEURISTICS["BLOCK"](heuristics)
+    num_warps = _UNIFORM_HEURISTICS["num_warps"](heuristics)
+    grid = (triton.cdiv(n_elements, block * _TRAIN_UNROLL),)
     philox_seed, philox_offset = philox_backend_seed_offset(
         triton.cdiv(n_elements, _TRAIN_UNROLL), generator=generator
     )
     with torch_device_fn.device(self.device):
-        _rrelu_with_noise_train_contiguous_kernel[grid_fn](
+        _rrelu_with_noise_train_contiguous_kernel[grid](
             self,
             noise,
             out,
@@ -204,6 +211,8 @@ def _launch_contiguous_train(self, noise, out, lower, upper, generator):
             float(upper),
             philox_seed,
             philox_offset,
+            BLOCK=block,
+            num_warps=num_warps,
         )
     return out
 
