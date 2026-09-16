@@ -457,6 +457,92 @@ def test_rrelu_with_noise_inplace_non_contiguous(training, dtype):
     assert torch.equal(noise_base[:, 1::2], untouched_noise)
 
 
+def _layout_inputs(dtype):
+    """Dense inputs whose layout differs from the result ATen returns.
+
+    Both are non-overlapping and dense, which is what makes them worth
+    checking: an allocation that preserves the input's layout (as
+    ``torch.empty_like`` does by default) keeps the layout here, while ATen
+    hands back a legacy contiguous result.
+    """
+    channels_last = (
+        torch.linspace(-2.0, 2.0, 2 * 8 * 4 * 4, dtype=dtype, device=flag_gems.device)
+        .reshape(2, 8, 4, 4)
+        .to(memory_format=torch.channels_last)
+    )
+    transposed = (
+        torch.linspace(-2.0, 2.0, 8 * 16, dtype=dtype, device=flag_gems.device)
+        .reshape(8, 16)
+        .t()
+    )
+    return [("channels_last", channels_last), ("transposed", transposed)]
+
+
+@pytest.mark.rrelu_with_noise
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("dtype", utils.PRIMARY_FLOAT_DTYPES)
+def test_rrelu_with_noise_output_strides(training, dtype):
+    """The out-of-place result comes back contiguous, as ATen returns it.
+
+    ``aten::rrelu_with_noise`` allocates its result in legacy contiguous
+    layout whatever layout the input has, so a channels-last or strided input
+    must not carry its layout into the result.  The values are checked as well
+    as the strides, because with the two tensors in different layouts it is
+    the indexing that can go wrong.
+    """
+    _skip_half_cpu_reference(dtype, training)
+    lower, upper = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+
+    for label, inp in _layout_inputs(dtype):
+        assert not inp.is_contiguous(), label
+        noise = torch.zeros_like(inp)
+        # The reference gets a contiguous noise buffer on purpose.  ATen's CUDA
+        # training kernel does ``noise_.contiguous()`` and samples into that copy,
+        # so with the input's layout the reference buffer would come back
+        # untouched.  ours keeps the input's layout, which is the interesting
+        # case; EQUAL_BOUNDS samples one slope value for every element, so the
+        # two buffers are still comparable elementwise.
+        ref_noise = utils.to_reference(
+            torch.zeros_like(inp, memory_format=torch.contiguous_format)
+        )
+
+        ref_out = torch.ops.aten.rrelu_with_noise(
+            utils.to_reference(inp.clone()), ref_noise, lower, upper, training
+        )
+
+        result = flag_gems.rrelu_with_noise(inp, noise, lower, upper, training)
+
+        assert result.is_contiguous(), label
+        assert result.stride() == ref_out.stride(), label
+        utils.gems_assert_close(result, ref_out, dtype)
+        utils.gems_assert_close(noise, ref_noise, dtype)
+
+
+@pytest.mark.rrelu_with_noise_
+@pytest.mark.parametrize("training", [False, True])
+def test_rrelu_with_noise_inplace_output_strides(training):
+    """The in-place result stays in the caller's layout, as ATen's does."""
+    lower, upper = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
+
+    for label, inp in _layout_inputs(torch.float32):
+        assert not inp.is_contiguous(), label
+        noise = torch.zeros_like(inp)
+        # Contiguous for the reference, see test_rrelu_with_noise_output_strides.
+        ref_noise = utils.to_reference(
+            torch.zeros_like(inp, memory_format=torch.contiguous_format)
+        )
+
+        ref_out = torch.ops.aten.rrelu_with_noise_(
+            utils.to_reference(inp.clone()), ref_noise, lower, upper, training
+        )
+
+        result = flag_gems.rrelu_with_noise_(inp, noise, lower, upper, training)
+
+        assert result.stride() == ref_out.stride(), label
+        utils.gems_assert_close(result, ref_out, torch.float32)
+        utils.gems_assert_close(noise, ref_noise, torch.float32)
+
+
 INVALID_ARG_CASES = [
     ("noise_shape", "same shape"),
     ("noise_dtype", "same dtype"),

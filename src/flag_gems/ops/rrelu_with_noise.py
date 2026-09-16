@@ -97,6 +97,14 @@ def _fill_training_noise(noise, lower, upper, generator):
     return sampled
 
 
+def _new_output(self):
+    # ``aten::rrelu_with_noise`` returns the out-of-place result in legacy
+    # contiguous layout, whatever the input layout is, so the allocation cannot
+    # keep ``empty_like``'s preserve_format default: a channels-last or strided
+    # input would otherwise come back in its own layout.
+    return torch.empty_like(self, memory_format=torch.contiguous_format)
+
+
 def _rrelu_with_noise_impl(
     self,
     noise,
@@ -109,20 +117,18 @@ def _rrelu_with_noise_impl(
     _check_rrelu_with_noise_args(self, noise, lower, upper)
 
     if self.numel() == 0:
-        return torch.empty_like(self) if out is None else out
+        return _new_output(self) if out is None else out
 
     if training:
         sampled_noise = _fill_training_noise(noise, lower, upper, generator)
-        if out is None:
-            output, _ = _rrelu_with_noise_train(self, sampled_noise, out1=noise)
-            return output
-        _rrelu_with_noise_train(self, sampled_noise, out0=out, out1=noise)
-        return out
+        output = out if out is not None else _new_output(self)
+        _rrelu_with_noise_train(self, sampled_noise, out0=output, out1=noise)
+        return output
     else:
         slope = (float(lower) + float(upper)) * 0.5
-        if out is None:
-            return _rrelu_with_noise_eval(self, slope)
-        return _rrelu_with_noise_eval(self, slope, out0=out)
+        output = out if out is not None else _new_output(self)
+        _rrelu_with_noise_eval(self, slope, out0=output)
+        return output
 
 
 def rrelu_with_noise(
