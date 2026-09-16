@@ -51,6 +51,9 @@ DEFAULT_UPPER = 0.3333333333333333
 
 _CONTIGUOUS_BLOCK_SIZE = 2048
 _CONTIGUOUS_NUM_WARPS = 8
+# Elements per program in the fused training kernel, as a multiple of the
+# BLOCK the uniform heuristic picks; must match the kernel's group count.
+_TRAIN_UNROLL = 4
 _INT32_MAX = torch.iinfo(torch.int32).max
 
 
@@ -71,29 +74,69 @@ def _rrelu_with_noise_eval_contiguous_kernel(
 
 
 @triton.jit
+def _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off, sampled, N):
+    """Apply rrelu to one group of elements with its sampled slopes.
+
+    ATen samples for self <= 0 (including signed zero), and records one for
+    positive/NaN elements.  Keeping this predicate aligned with backward is
+    important because noise is the training-time gradient multiplier.
+    """
+    mask = off < N
+    x = tl.load(x_ptr + off, mask=mask, other=0.0)
+
+    not_positive = x <= 0
+    effective_noise = tl.where(not_positive, sampled, 1.0)
+
+    tl.store(out_ptr + off, tl.where(not_positive, x * effective_noise, x), mask=mask)
+    tl.store(noise_ptr + off, effective_noise, mask=mask)
+
+
+# The count argument is spelled ``N`` because the heuristic config is keyed on
+# that name, exactly as in the generic ``uniform``.
+@triton.heuristics(runtime.get_heuristic_config("uniform"))
+@triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def _rrelu_with_noise_train_contiguous_kernel(
     x_ptr,
     noise_ptr,
     out_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
+    N,
+    lower,
+    upper,
+    philox_seed,
+    philox_offset,
+    BLOCK: tl.constexpr,
 ):
-    # ATen samples for self <= 0 (including signed zero), and records one for
-    # positive/NaN elements.  Keeping this predicate aligned with backward is
-    # important because noise is the training-time gradient multiplier.
+    # Training samples the noise workspace before every call.  ATen draws those
+    # values inside its training kernel, so fuse the draw in here too: a
+    # separate uniform pass costs an extra launch and another full write over
+    # the workspace.  The counter layout is the generic ``uniform`` one, a
+    # single draw per BLOCK lanes spread over four groups, so the generator
+    # advances by exactly as much as a ``uniform_`` over the same number of
+    # elements would.
+    philox_seed = philox_seed.to(tl.int64)
+    philox_offset = philox_offset.to(tl.int64)
+    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)
+    c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
     pid = tl.program_id(axis=0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    lane = pid * BLOCK + tl.arange(0, BLOCK)
+    c0 += lane
+    zero = c0 * 0
 
-    x = tl.load(x_ptr + offsets, mask=mask, other=0)
-    noise = tl.load(noise_ptr + offsets, mask=mask, other=0)
+    r0, r1, r2, r3 = tl.philox(philox_seed, c0, c1, zero, zero)
+    scale = upper - lower
+    r0 = uint_to_uniform_float(r0) * scale + lower
+    r1 = uint_to_uniform_float(r1) * scale + lower
+    r2 = uint_to_uniform_float(r2) * scale + lower
+    r3 = uint_to_uniform_float(r3) * scale + lower
 
-    not_positive = x <= 0
-    effective_noise = tl.where(not_positive, noise, 1.0)
-    output = tl.where(not_positive, x * effective_noise, x)
-
-    tl.store(out_ptr + offsets, output, mask=mask)
-    tl.store(noise_ptr + offsets, effective_noise, mask=mask)
+    off_0 = pid * BLOCK * 4 + tl.arange(0, BLOCK)
+    off_1 = off_0 + BLOCK
+    off_2 = off_1 + BLOCK
+    off_3 = off_2 + BLOCK
+    _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off_0, r0, N)
+    _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off_1, r1, N)
+    _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off_2, r2, N)
+    _rrelu_with_noise_train_group(x_ptr, noise_ptr, out_ptr, off_3, r3, N)
 
 
 # Fallback paths.  These are the same pointwise_dynamic kernels the generic
@@ -143,19 +186,24 @@ def _launch_contiguous_eval(self, out, slope):
     return out
 
 
-def _launch_contiguous_train(self, noise, out):
+def _launch_contiguous_train(self, noise, out, lower, upper, generator):
     n_elements = out.numel()
     if n_elements == 0:
         return out
-    grid = (triton.cdiv(n_elements, _CONTIGUOUS_BLOCK_SIZE),)
+    grid_fn = lambda meta: (triton.cdiv(n_elements, meta["BLOCK"] * _TRAIN_UNROLL),)
+    philox_seed, philox_offset = philox_backend_seed_offset(
+        triton.cdiv(n_elements, _TRAIN_UNROLL), generator=generator
+    )
     with torch_device_fn.device(self.device):
-        _rrelu_with_noise_train_contiguous_kernel[grid](
+        _rrelu_with_noise_train_contiguous_kernel[grid_fn](
             self,
             noise,
             out,
             n_elements,
-            BLOCK_SIZE=_CONTIGUOUS_BLOCK_SIZE,
-            num_warps=_CONTIGUOUS_NUM_WARPS,
+            float(lower),
+            float(upper),
+            philox_seed,
+            philox_offset,
         )
     return out
 
@@ -303,12 +351,14 @@ def _rrelu_with_noise_impl(
             return _rrelu_with_noise_eval_generic(self, slope)
         return _rrelu_with_noise_eval_generic(self, slope, out0=out)
 
-    sampled_noise = _fill_training_noise(noise, lower, upper, generator)
-    if fast_path and sampled_noise is noise:
+    if fast_path:
+        # Training draws the noise in the kernel, so nothing has to be filled
+        # beforehand here.
         return _launch_contiguous_train(
-            self, noise, self if inplace else _new_output(self)
+            self, noise, self if inplace else _new_output(self), lower, upper, generator
         )
 
+    sampled_noise = _fill_training_noise(noise, lower, upper, generator)
     if allocate:
         output, _ = _rrelu_with_noise_train_generic(
             self, sampled_noise, out0=_new_output(self), out1=noise
