@@ -265,6 +265,14 @@ def _fill_training_noise(noise, lower, upper, generator):
     return _fill_uniform_contiguous(sampled, float(lower), float(upper), generator)
 
 
+def _new_output(self):
+    # ``aten::rrelu_with_noise`` returns the out-of-place result in legacy
+    # contiguous layout, whatever the input layout is, so the allocation cannot
+    # keep ``empty_like``'s preserve_format default: a channels-last or strided
+    # input would otherwise come back in its own layout.
+    return torch.empty_like(self, memory_format=torch.contiguous_format)
+
+
 def _rrelu_with_noise_impl(
     self,
     noise,
@@ -277,7 +285,7 @@ def _rrelu_with_noise_impl(
     _check_rrelu_with_noise_args(self, noise, lower, upper)
 
     if self.numel() == 0:
-        return torch.empty_like(self) if out is None else out
+        return _new_output(self) if out is None else out
 
     # `out` is either None (allocate) or `self` (in-place variant); anything
     # else is not reachable through the public API and takes the generic path.
@@ -289,7 +297,7 @@ def _rrelu_with_noise_impl(
         slope = (float(lower) + float(upper)) * 0.5
         if fast_path:
             return _launch_contiguous_eval(
-                self, self if inplace else torch.empty_like(self), slope
+                self, self if inplace else _new_output(self), slope
             )
         if allocate:
             return _rrelu_with_noise_eval_generic(self, slope)
@@ -298,11 +306,13 @@ def _rrelu_with_noise_impl(
     sampled_noise = _fill_training_noise(noise, lower, upper, generator)
     if fast_path and sampled_noise is noise:
         return _launch_contiguous_train(
-            self, noise, self if inplace else torch.empty_like(self)
+            self, noise, self if inplace else _new_output(self)
         )
 
     if allocate:
-        output, _ = _rrelu_with_noise_train_generic(self, sampled_noise, out1=noise)
+        output, _ = _rrelu_with_noise_train_generic(
+            self, sampled_noise, out0=_new_output(self), out1=noise
+        )
         return output
     _rrelu_with_noise_train_generic(self, sampled_noise, out0=out, out1=noise)
     return out
