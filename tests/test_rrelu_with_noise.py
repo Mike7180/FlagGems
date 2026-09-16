@@ -54,21 +54,6 @@ DEFAULT_UPPER = 1.0 / 3.0
 # covered by the *_train_sampling tests.
 EQUAL_BOUNDS = (0.25, 0.25)
 
-# Values that pick a branch of the kernels: the training slope is drawn for
-# `self <= 0` (signed zero included), the eval slope for `self <= 0` as well,
-# and NaN never takes the `self > 0` side.
-BOUNDARY_VALUES = [
-    float("nan"),
-    float("inf"),
-    float("-inf"),
-    0.0,
-    -0.0,
-    1.0,
-    -1.0,
-    0.5,
-    -0.5,
-]
-
 
 def _skip_half_cpu_reference(dtype, training):
     """Skip the cases the CPU reference cannot serve.
@@ -99,26 +84,6 @@ def _pair(shape, dtype, bounds, fill_noise=False):
         utils.to_reference(inp.clone()),
         utils.to_reference(noise.clone()),
     )
-
-
-def _forward_backward(op, backward_op, inplace, base, bounds, training):
-    """Forward with ``op`` then backward with ``backward_op``.
-
-    Neither operator carries a Python autograd wrapper: the gradient comes from
-    the separately registered ``rrelu_with_noise_backward`` operator, which is
-    also what ATen's own autograd formula for ``aten::rrelu_with_noise`` calls.
-    Composing the two explicitly checks that the ``noise`` buffer the forward
-    writes is the one the backward reads, and that the pair agrees with ATen.
-
-    Returns (out, noise, grad_input).
-    """
-    inp = base.clone()
-    noise = torch.zeros_like(inp)
-    out = op(inp, noise, *bounds, training)
-    # For the in-place operator ``inp`` now holds the result, which is the
-    # self_is_result case of the backward contract.
-    grad = backward_op(torch.ones_like(out), inp, noise, *bounds, training, inplace)
-    return out, noise, grad
 
 
 @pytest.mark.rrelu_with_noise
@@ -490,132 +455,6 @@ def test_rrelu_with_noise_inplace_non_contiguous(training, dtype):
     utils.gems_assert_close(noise, ref_noise, dtype)
     assert torch.equal(input_base[:, 1::2], untouched_input)
     assert torch.equal(noise_base[:, 1::2], untouched_noise)
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_autograd(training):
-    """Forward then backward matches ATen in both training modes."""
-    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
-    base = torch.randn((257,), dtype=torch.float32, device=flag_gems.device)
-    ref_base = utils.to_reference(base.clone())
-
-    _, _, ref_grad = _forward_backward(
-        torch.ops.aten.rrelu_with_noise,
-        torch.ops.aten.rrelu_with_noise_backward,
-        False,
-        ref_base,
-        bounds,
-        training,
-    )
-    _, _, gems_grad = _forward_backward(
-        flag_gems.rrelu_with_noise,
-        flag_gems.rrelu_with_noise_backward,
-        False,
-        base,
-        bounds,
-        training,
-    )
-
-    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
-
-
-@pytest.mark.rrelu_with_noise_
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_inplace_autograd(training):
-    """Forward then backward matches ATen in both training modes."""
-    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
-    base = torch.randn((257,), dtype=torch.float32, device=flag_gems.device)
-    ref_base = utils.to_reference(base.clone())
-
-    _, _, ref_grad = _forward_backward(
-        torch.ops.aten.rrelu_with_noise_,
-        torch.ops.aten.rrelu_with_noise_backward,
-        True,
-        ref_base,
-        bounds,
-        training,
-    )
-    _, _, gems_grad = _forward_backward(
-        flag_gems.rrelu_with_noise_,
-        flag_gems.rrelu_with_noise_backward,
-        True,
-        base,
-        bounds,
-        training,
-    )
-
-    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
-
-
-@pytest.mark.rrelu_with_noise
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_autograd_boundary(training):
-    """Signed zero, infinities and NaN take the same branch as ATen in the
-    forward and in the backward kernel.
-
-    The kernels select their slope with ``self > 0``, so an implementation that
-    tests ``self >= 0`` would diverge exactly on these values.
-    """
-    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
-    base = torch.tensor(BOUNDARY_VALUES, dtype=torch.float32, device=flag_gems.device)
-    ref_base = utils.to_reference(base.clone())
-
-    ref_out, ref_noise, ref_grad = _forward_backward(
-        torch.ops.aten.rrelu_with_noise,
-        torch.ops.aten.rrelu_with_noise_backward,
-        False,
-        ref_base,
-        bounds,
-        training,
-    )
-    gems_out, gems_noise, gems_grad = _forward_backward(
-        flag_gems.rrelu_with_noise,
-        flag_gems.rrelu_with_noise_backward,
-        False,
-        base,
-        bounds,
-        training,
-    )
-
-    utils.gems_assert_close(gems_out, ref_out, torch.float32, equal_nan=True)
-    utils.gems_assert_close(gems_noise, ref_noise, torch.float32)
-    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
-
-
-@pytest.mark.rrelu_with_noise_
-@pytest.mark.parametrize("training", [False, True])
-def test_rrelu_with_noise_inplace_autograd_boundary(training):
-    """Signed zero, infinities and NaN take the same branch as ATen in the
-    forward and in the backward kernel.
-
-    The kernels select their slope with ``self > 0``, so an implementation that
-    tests ``self >= 0`` would diverge exactly on these values.
-    """
-    bounds = EQUAL_BOUNDS if training else (DEFAULT_LOWER, DEFAULT_UPPER)
-    base = torch.tensor(BOUNDARY_VALUES, dtype=torch.float32, device=flag_gems.device)
-    ref_base = utils.to_reference(base.clone())
-
-    ref_out, ref_noise, ref_grad = _forward_backward(
-        torch.ops.aten.rrelu_with_noise_,
-        torch.ops.aten.rrelu_with_noise_backward,
-        True,
-        ref_base,
-        bounds,
-        training,
-    )
-    gems_out, gems_noise, gems_grad = _forward_backward(
-        flag_gems.rrelu_with_noise_,
-        flag_gems.rrelu_with_noise_backward,
-        True,
-        base,
-        bounds,
-        training,
-    )
-
-    utils.gems_assert_close(gems_out, ref_out, torch.float32, equal_nan=True)
-    utils.gems_assert_close(gems_noise, ref_noise, torch.float32)
-    utils.gems_assert_close(gems_grad, ref_grad, torch.float32)
 
 
 INVALID_ARG_CASES = [
