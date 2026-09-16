@@ -236,7 +236,9 @@ print(f"torch/triton      {torch.__version__} / {triton.__version__}")
 print(f"fused kernel      {hasattr(hy, '_rrelu_with_noise_train_group')}")
 print(f"source            {hy.__file__}")
 print(f"generator         {type(gen).__name__}, state on {state.device}")
-print(f"gems rrelu        {getattr(flag_gems.ops.rrelu_with_noise, '__module__', '?')}")
+_patched = getattr(flag_gems.ops, "rrelu_with_noise", None)
+print(f"gems rrelu        {getattr(_patched, '__module__', 'not in flag_gems.ops')}")
+print(f"rrelu names       {[n for n in dir(flag_gems.ops) if 'rrelu' in n]}")
 print(f"flush              {FLUSH:8.1f} us of device time per round")
 
 for patch in (None, ["zero_"]):
