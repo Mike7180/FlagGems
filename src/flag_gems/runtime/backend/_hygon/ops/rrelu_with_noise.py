@@ -29,6 +29,7 @@ the generic ``rrelu_with_noise`` / ``rrelu_with_noise_`` by function name, so
 no other backend is affected.
 """
 
+import contextlib
 import logging
 import math
 
@@ -39,10 +40,7 @@ import triton.language as tl
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import pointwise_dynamic
-from flag_gems.utils.random_utils import (
-    philox_backend_seed_offset,
-    uint_to_uniform_float,
-)
+from flag_gems.utils.random_utils import uint_to_uniform_float
 
 logger = logging.getLogger(__name__)
 
@@ -173,12 +171,46 @@ def _can_use_contiguous_path(self, noise):
     return self.is_contiguous() and noise.is_contiguous() and self.numel() <= _INT32_MAX
 
 
+def _device_ctx(device):
+    """``torch_device_fn.device``, skipped when it would be a no-op.
+
+    Switching the device costs about 9 us per launch on this backend's host,
+    and the contiguous paths only ever see tensors that are already on the
+    current device.  The guard is still taken when they are not.
+    """
+    index = device.index
+    if index is None or index == torch_device_fn.current_device():
+        return contextlib.nullcontext()
+    return torch_device_fn.device(device)
+
+
+def _next_philox_state(increment, generator=None):
+    """``philox_backend_seed_offset`` with the state arithmetic kept here.
+
+    Same seed, same offset, and the same advance of ``generator`` as the
+    shared helper -- but that helper walks a per-vendor branch table and
+    round-trips the state through more dispatches, which on this backend's
+    host costs more than the kernel launch it feeds.  The generator state is
+    two int64s at this vendor, which is what the shared helper's own
+    unpacking assumes, so unpacking the same two values here is equivalent.
+    """
+    if generator is None:
+        generator = torch_device_fn.default_generators[torch_device_fn.current_device()]
+    state = generator.get_state()
+    state_view = state.view(torch.int64)
+    seed, offset = state_view.tolist()
+    # Four lanes share one counter, so the offset advances in whole groups.
+    state_view[1] = offset + (increment + 3) // 4 * 4
+    generator.set_state(state)
+    return seed, offset
+
+
 def _launch_contiguous_eval(self, out, slope):
     n_elements = out.numel()
     if n_elements == 0:
         return out
     grid = (triton.cdiv(n_elements, _CONTIGUOUS_BLOCK_SIZE),)
-    with torch_device_fn.device(self.device):
+    with _device_ctx(self.device):
         _rrelu_with_noise_eval_contiguous_kernel[grid](
             self,
             out,
@@ -198,10 +230,10 @@ def _launch_contiguous_train(self, noise, out, lower, upper, generator):
     block = _UNIFORM_HEURISTICS["BLOCK"](heuristics)
     num_warps = _UNIFORM_HEURISTICS["num_warps"](heuristics)
     grid = (triton.cdiv(n_elements, block * _TRAIN_UNROLL),)
-    philox_seed, philox_offset = philox_backend_seed_offset(
+    philox_seed, philox_offset = _next_philox_state(
         triton.cdiv(n_elements, _TRAIN_UNROLL), generator=generator
     )
-    with torch_device_fn.device(self.device):
+    with _device_ctx(self.device):
         _rrelu_with_noise_train_contiguous_kernel[grid](
             self,
             noise,
@@ -302,10 +334,8 @@ def _fill_uniform_contiguous(out, lower, upper, generator):
         return out
     grid_fn = lambda meta: (triton.cdiv(N, meta["BLOCK"] * _UNIFORM_UNROLL),)
     increment = triton.cdiv(N, _UNIFORM_UNROLL)
-    philox_seed, philox_offset = philox_backend_seed_offset(
-        increment, generator=generator
-    )
-    with torch_device_fn.device(out.device):
+    philox_seed, philox_offset = _next_philox_state(increment, generator=generator)
+    with _device_ctx(out.device):
         _uniform_contiguous_kernel[grid_fn](
             out, N, philox_seed, philox_offset, lower, upper
         )
