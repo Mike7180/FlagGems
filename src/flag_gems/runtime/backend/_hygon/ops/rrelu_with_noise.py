@@ -386,9 +386,9 @@ def _rrelu_with_noise_impl(
             return _launch_contiguous_eval(
                 self, self if inplace else _new_output(self), slope
             )
-        if allocate:
-            return _rrelu_with_noise_eval_generic(self, slope)
-        return _rrelu_with_noise_eval_generic(self, slope, out0=out)
+        output = out if out is not None else _new_output(self)
+        _rrelu_with_noise_eval_generic(self, slope, out0=output)
+        return output
 
     if fast_path:
         # Training draws the noise in the kernel, so nothing has to be filled
