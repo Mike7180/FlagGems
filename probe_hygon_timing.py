@@ -31,8 +31,10 @@ Run it on the benchmark host with ``python probe_hygon_timing.py`` and paste
 the output back.
 """
 
+import ctypes
 import importlib
 import os
+import struct
 import statistics
 import time
 
@@ -122,6 +124,79 @@ def seeded_inline():
     launch(*philox_inline())
 
 
+def train_no_seed():
+    """The full training call with the seed bookkeeping stubbed out."""
+    saved = hy._next_philox_state
+    hy._next_philox_state = lambda increment, generator=None: (1234, 5678)
+    try:
+        return hy.rrelu_with_noise(x, noise, LOWER, UPPER, True)
+    finally:
+        hy._next_philox_state = saved
+
+
+def state_read():
+    """The read half of the state round trip."""
+    return gen.get_state().view(torch.int64).tolist()
+
+
+def state_write():
+    """The write half: advance the offset in the existing state tensor.
+
+    This is the one piece of the round trip that was never measured on its own.
+    """
+    _counter[0] += 1
+    sv[1] = _counter[0]
+    return _counter[0]
+
+
+def next_state_raw(increment=None):
+    """Candidate: read and write the two int64s through the state's buffer.
+
+    ``get_state`` hands back a fresh 16-byte CPU tensor, so touching its bytes
+    directly skips the ``view`` and the ``select``/``copy_`` pair that a
+    ``__setitem__`` costs.  The two-int64 layout is the one the shared helper
+    already relies on.  Same seed, same offset, same advance.
+    """
+    increment = INCR if increment is None else increment
+    state = gen.get_state()
+    ptr = state.data_ptr()
+    seed, offset = struct.unpack_from("<qq", ctypes.string_at(ptr, 16))
+    advance = (increment + 3) // 4 * 4
+    ctypes.memmove(ptr + 8, struct.pack("<q", offset + advance), 8)
+    gen.set_state(state)
+    return seed, offset
+
+
+def next_state_frombuffer(increment=None):
+    """Candidate: rebuild the state as bytes instead of editing a view.
+
+    One dispatch fewer than the ``view`` + ``__setitem__`` pair, and no view
+    object to build.  Same seed, same offset, same advance.
+    """
+    increment = INCR if increment is None else increment
+    state = gen.get_state()
+    seed, offset = state.view(torch.int64).tolist()
+    advance = (increment + 3) // 4 * 4
+    packed = struct.pack("<qq", seed, offset + advance)
+    gen.set_state(torch.frombuffer(packed, dtype=torch.uint8))
+    return seed, offset
+
+
+def check_args():
+    return hy._check_rrelu_with_noise_args(x, noise, LOWER, UPPER)
+
+
+def heuristics():
+    return (
+        hy._UNIFORM_HEURISTICS["BLOCK"]({"N": N}),
+        hy._UNIFORM_HEURISTICS["num_warps"]({"N": N}),
+    )
+
+
+def alloc_contiguous():
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
+
+
 def py_work():
     """Pure host work, no torch at all: is the CPU itself slower when the
     device is busy?  If this row inflates, the extra time is not ours."""
@@ -151,6 +226,17 @@ ROWS = [
     ("hygon eval", lambda: hy.rrelu_with_noise(x, noise, LOWER, UPPER, False)),
     ("hygon train", lambda: hy.rrelu_with_noise(x, noise, LOWER, UPPER, True)),
     ("hygon train inplace", lambda: hy.rrelu_with_noise_(x, noise, LOWER, UPPER, True)),
+    # The rows below split the training path's non-launch cost into its pieces,
+    # so the next round of tuning has numbers instead of guesses.
+    ("train, seed stubbed", train_no_seed),
+    ("check args", check_args),
+    ("heuristics", heuristics),
+    ("alloc contiguous", alloc_contiguous),
+    ("_next_philox_state", lambda: hy._next_philox_state(INCR)),
+    ("state: get+view+tolist", state_read),
+    ("state: setitem", state_write),
+    ("next_state (raw bytes)", next_state_raw),
+    ("next_state (frombuffer)", next_state_frombuffer),
 ]
 
 
