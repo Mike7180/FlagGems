@@ -7,7 +7,7 @@ import triton.language as tl
 from flag_gems.utils import libentry
 from flag_gems.utils.triton_version_utils import HAS_TLE
 
-HAS_TLE = False
+HAS_TLE = None  # noqa: F811
 
 if HAS_TLE:
     import triton.experimental.tle.language as tle
