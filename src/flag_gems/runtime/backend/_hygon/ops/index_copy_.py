@@ -227,6 +227,43 @@ _FALLBACK_KEYSET = torch._C.DispatchKeySet(
 )
 
 
+@libentry()
+@triton.jit
+def _hygon_clone_kernel(inp, out, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if (pid + 1) * BLOCK_SIZE <= n_elements:
+        # The whole block is in range: every lane index is below n_elements, so
+        # no per-lane mask is needed and the accesses stay vectorised. A mask
+        # costs one predicate per element, which pins the copy to an element
+        # rate regardless of dtype.
+        tl.store(out + offsets, tl.load(inp + offsets))
+    else:
+        # Only the final block can be partial; keep the masked path for it.
+        mask = offsets < n_elements
+        value = tl.load(inp + offsets, mask=mask)
+        tl.store(out + offsets, value, mask=mask)
+
+
+def _clone_without_copy_dispatch(inp):
+    # Local clone so that re-dispatch into gems copy_/clone kernels under
+    # `flag_gems.use_gems()` cannot add its host overhead. Non-contiguous
+    # inputs still go through aten, since the flat-index kernel assumes a
+    # contiguous layout.
+    if not inp.is_contiguous():
+        return torch.ops.aten.clone.default.redispatch(_FALLBACK_KEYSET, inp)
+
+    out = torch.empty_like(inp)
+    n_elements = inp.numel()
+    if n_elements == 0:
+        return out
+
+    block_size = 256
+    grid = (triton.cdiv(n_elements, block_size),)
+    _hygon_clone_kernel[grid](inp, out, n_elements, BLOCK_SIZE=block_size)
+    return out
+
+
 def index_copy(inp, dim, index, src):
     logger.debug("GEMS_HYGON INDEX_COPY")
     # The specialized kernels cover up to 3D; fall back to the generic
@@ -235,9 +272,7 @@ def index_copy(inp, dim, index, src):
         return default_index_copy(inp, dim, index, src)
     _validate(inp, dim, index, src)
     dim %= inp.ndim
-    # Native clone to avoid re-dispatch into gems copy_/clone kernels under
-    # `flag_gems.use_gems()`, which would add significant host overhead.
-    out = torch.ops.aten.clone.default.redispatch(_FALLBACK_KEYSET, inp)
+    out = _clone_without_copy_dispatch(inp)
     return _launch(out, dim, index, src)
 
 
