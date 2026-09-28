@@ -249,9 +249,13 @@ def _clone_without_copy_dispatch(inp):
     if n_elements == 0:
         return out
 
-    block_size = 256
+    # 8 elements per lane. With the previous BLOCK_SIZE=256 (2 per lane) the
+    # copy was issue-bound at 304 GB/s on Hygon regardless of dtype; this
+    # reaches 1311 GB/s (measured, fp16 8192x8192), which is what the hardware
+    # actually has.
+    block_size = 2048
     grid = (triton.cdiv(n_elements, block_size),)
-    _hygon_clone_kernel[grid](inp, out, n_elements, BLOCK_SIZE=block_size)
+    _hygon_clone_kernel[grid](inp, out, n_elements, BLOCK_SIZE=block_size, num_warps=8)
     return out
 
 
