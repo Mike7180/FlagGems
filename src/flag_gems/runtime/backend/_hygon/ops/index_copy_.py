@@ -230,19 +230,10 @@ _FALLBACK_KEYSET = torch._C.DispatchKeySet(
 @libentry()
 @triton.jit
 def _hygon_clone_kernel(inp, out, n_elements, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    if (pid + 1) * BLOCK_SIZE <= n_elements:
-        # The whole block is in range: every lane index is below n_elements, so
-        # no per-lane mask is needed and the accesses stay vectorised. A mask
-        # costs one predicate per element, which pins the copy to an element
-        # rate regardless of dtype.
-        tl.store(out + offsets, tl.load(inp + offsets))
-    else:
-        # Only the final block can be partial; keep the masked path for it.
-        mask = offsets < n_elements
-        value = tl.load(inp + offsets, mask=mask)
-        tl.store(out + offsets, value, mask=mask)
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    value = tl.load(inp + offsets, mask=mask)
+    tl.store(out + offsets, value, mask=mask)
 
 
 def _clone_without_copy_dispatch(inp):
