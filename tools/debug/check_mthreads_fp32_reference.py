@@ -169,6 +169,29 @@ def _probe_flag_gems():
     )
 
 
+def _probe_tf32_truncation():
+    # 1 + 3*2^-13 is exact in fp32 (13 significand bits) but rounds to 1.0 in
+    # TF32: TF32 keeps 10 stored mantissa bits, so half an ulp at 1.0 is 2^-11
+    # and 3*2^-13 < 2^-11. With an all-ones kernel the interior outputs sum
+    # 2 channels x 9 taps = 18 terms, so an fp32-exact convolution returns
+    # 18.006591796875 while a TF32 one returns exactly 18.0.
+    device = torch.device("musa")
+    value = 1.0 + 3.0 * 2.0**-13
+    x = torch.full((4, 4, 8, 8), value, device=device)
+    w = torch.ones(4, 2, 3, 3, device=device)
+    try:
+        y = torch.nn.functional.conv2d(x, w, padding=1, groups=2)
+    except Exception as exc:  # pragma: no cover - diagnostic script
+        print(f"  conv2d groups=2 failed: {exc!r}")
+        return
+    interior = (x.shape[2] - 2) * (x.shape[3] - 2) * y.shape[0] * y.shape[1]
+    hits = int((y == 18.0).sum().item())
+    print(f"  input value = 0x{value.hex()} ({value!r})")
+    print(f"  fp32-exact interior value = {18.0 * value!r}; TF32-truncated = 18.0")
+    print(f"  interior outputs = {interior}; outputs exactly equal to 18.0 = {hits}")
+    print(f"  observed output range = [{y.min().item()!r}, {y.max().item()!r}]")
+
+
 def main():
     print(f"torch {torch.__version__}")
     if hasattr(torch, "musa") and hasattr(torch.musa, "is_available"):
@@ -186,6 +209,9 @@ def main():
 
     print("\nflag_gems kernel:")
     _probe_flag_gems()
+
+    print("\nTF32 truncation probe:")
+    _probe_tf32_truncation()
 
     if not knobs:
         print(
