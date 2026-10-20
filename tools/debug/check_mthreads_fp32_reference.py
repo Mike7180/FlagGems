@@ -43,6 +43,11 @@ except ImportError as exc:  # pragma: no cover - diagnostic script
     raise SystemExit(f"torch_musa is required for this probe: {exc!r}")
 
 
+# The test's fp32 tolerance is atol=1e-4, rtol=1.3e-6. Printing the error in
+# units of atol makes the reference's excess easy to read.
+F32_ATOL = 1e-4
+
+
 def _max_err(y, ref):
     return (y.cpu().double() - ref).abs().max().item()
 
@@ -102,9 +107,18 @@ def _make_cases():
 
 def _run_cases():
     for name, conv, x, w, kwargs in _make_cases():
-        y = conv(x, w, **kwargs)
-        ref = conv(x.cpu().double(), w.cpu().double(), **kwargs)
-        print(f"  {name:<26} max|device - cpu_fp64| = {_max_err(y, ref):.3e}")
+        try:
+            y = conv(x, w, **kwargs)
+            ref = conv(x.cpu().double(), w.cpu().double(), **kwargs)
+            err = _max_err(y, ref)
+            print(
+                f"  {name:<26} max|device - cpu_fp64| = {err:.3e}"
+                f"  ({err / F32_ATOL:,.1f}x atol)"
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic script
+            # MUDNN rejects some configs outright (e.g. grouped convs with
+            # allow_tf32=False); keep probing the remaining cases.
+            print(f"  {name:<26} FAILED: {exc}")
 
 
 def _reduced_precision_knobs():
@@ -147,9 +161,11 @@ def _probe_flag_gems():
     ref = torch.nn.functional.conv2d(
         x.cpu().double(), w.cpu().double(), padding=1, groups=2
     )
+    err = _max_err(y, ref)
     print(
         "  flag_gems.cudnn_convolution groups=2"
-        f" max|gems - cpu_fp64| = {_max_err(y, ref):.3e}"
+        f" max|gems - cpu_fp64| = {err:.3e}"
+        f"  ({err / F32_ATOL:,.2f}x atol)"
     )
 
 
